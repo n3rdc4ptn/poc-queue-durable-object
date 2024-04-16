@@ -42,6 +42,9 @@ export class MyDurableObject extends DurableObject<Env> {
 	async get_finished_pages(): Promise<Set<number>> {
 		return (await this.ctx.storage.get('finished_pages')) || new Set();
 	}
+	async delete() {
+		await this.ctx.storage.deleteAll();
+	}
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -109,7 +112,7 @@ export default {
 					execution_random_id,
 					'Document:',
 					message.body.document_id,
-					'Message:',
+					'Page:',
 					message.body.page,
 					'/',
 					message.body.total_pages
@@ -118,10 +121,12 @@ export default {
 				if (message.body.page) {
 					const id = await env.MY_DURABLE_OBJECT.idFromName(message.body.document_id);
 					const stub = env.MY_DURABLE_OBJECT.get(id);
+
 					await stub.finished_page(message.body.page);
 
 					if (await stub.is_finished()) {
 						await env.MY_QUEUE.send({ type: 'end', document_id: message.body.document_id, start_time: message.body.start_time });
+						await stub.delete();
 					}
 				}
 			}
