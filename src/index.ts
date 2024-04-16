@@ -1,78 +1,130 @@
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+import { Hono } from 'hono';
+import { DurableObject } from 'cloudflare:workers';
 
-/**
- * Associate bindings declared in wrangler.toml with the TypeScript type system
- */
-export interface Env {
-	// Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
-	// MY_KV_NAMESPACE: KVNamespace;
-	//
-	// Example binding to Durable Object. Learn more at https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-	MY_DURABLE_OBJECT: DurableObjectNamespace;
-	//
-	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
-	// MY_BUCKET: R2Bucket;
-	//
-	// Example binding to a Service. Learn more at https://developers.cloudflare.com/workers/runtime-apis/service-bindings/
-	// MY_SERVICE: Fetcher;
-	//
-	// Example binding to a Queue. Learn more at https://developers.cloudflare.com/queues/javascript-apis/
-	// MY_QUEUE: Queue;
-}
+export type Env = {
+	MY_DURABLE_OBJECT: DurableObjectNamespace<MyDurableObject>;
+	MY_QUEUE: Queue;
+	DELAY_PER_QUEUE_EXECUTION: number;
+	RANDOMIZE_TO_MAX: boolean;
+};
+
+export type QueueMessage = {
+	type: 'page' | 'end';
+	start_time: number;
+
+	document_id: string;
+	page?: number;
+	total_pages?: number;
+};
 
 /** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier
-	 *
-	 * @param state - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.toml
-	 */
-	constructor(state: DurableObjectState, env: Env) {}
+export class MyDurableObject extends DurableObject<Env> {
+	async set_amount_of_pages(amount: number) {
+		await this.ctx.storage.put('amount_of_pages', amount);
+	}
+	async finished_page(page_num: number) {
+		const finished_pages: Set<number> = (await this.ctx.storage.get('finished_pages')) || new Set();
 
-	/**
-	 * The Durable Object fetch handler will be invoked when a Durable Object instance receives a
-	 * 	request from a Worker via an associated stub
-	 *
-	 * @param request - The request submitted to a Durable Object instance from a Worker
-	 * @returns The response to be sent back to the Worker
-	 */
-	async fetch(request: Request): Promise<Response> {
-		return new Response('Hello World');
+		finished_pages.add(page_num);
+
+		await this.ctx.storage.put('finished_pages', finished_pages);
+	}
+	async is_finished() {
+		const finished_pages: Set<number> = (await this.ctx.storage.get('finished_pages')) || new Set();
+		const amount_of_pages = (await this.ctx.storage.get('amount_of_pages')) || 0;
+
+		if (finished_pages.size === amount_of_pages) {
+			return true;
+		}
+
+		return false;
+	}
+	async get_finished_pages(): Promise<Set<number>> {
+		return (await this.ctx.storage.get('finished_pages')) || new Set();
 	}
 }
 
+const app = new Hono<{ Bindings: Env }>();
+
+app.get('/send_to_queue', async (c) => {
+	// Currently a limit by cloudflare
+	const defaultAmount = 100;
+	const amount = parseInt(c.req.query('amount') || defaultAmount.toString()) || defaultAmount;
+
+	const document_id = Math.random().toString(36).substring(7);
+
+	const id = await c.env.MY_DURABLE_OBJECT.idFromName(document_id);
+	const stub = c.env.MY_DURABLE_OBJECT.get(id);
+	await stub.set_amount_of_pages(amount);
+
+	let messages: QueueMessage[] = Array.from({ length: amount }, (_, i) => ({
+		type: 'page',
+		start_time: Date.now(),
+		document_id,
+		page: i + 1,
+		total_pages: amount,
+	}));
+
+	let queue = c.env.MY_QUEUE;
+
+	let messageRequest: MessageSendRequest[] = messages.map((message) => ({
+		body: message,
+	}));
+
+	await queue.sendBatch(messageRequest);
+
+	return c.text(`Document: ${document_id}. Sent ${amount} messages to the queue!`);
+});
+
+app.get('/status', async (c) => {
+	const document_id = c.req.query('document_id') || '';
+
+	const id = await c.env.MY_DURABLE_OBJECT.idFromName(document_id);
+	const stub = c.env.MY_DURABLE_OBJECT.get(id);
+
+	const finished = await stub.is_finished();
+	const finished_pages = await stub.get_finished_pages();
+
+	return c.json({ finished, finished_pages: Array.from(finished_pages) });
+});
+
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.toml
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		// We will create a `DurableObjectId` using the pathname from the Worker request
-		// This id refers to a unique instance of our 'MyDurableObject' class above
-		let id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(new URL(request.url).pathname);
+	fetch: app.fetch,
+	async queue(batch: MessageBatch<QueueMessage>, env: Env): Promise<void> {
+		const execution_random_id = Math.random().toString(36).substring(4);
 
-		// This stub creates a communication channel with the Durable Object instance
-		// The Durable Object constructor will be invoked upon the first call for a given id
-		let stub: DurableObjectStub = env.MY_DURABLE_OBJECT.get(id);
+		for (let message of batch.messages) {
+			if (message.body.type === 'end') {
+				const duration = Date.now() - message.body.start_time;
+				console.log('Execution:', execution_random_id, '== Finished document:', message.body.document_id, 'in', duration, 'ms');
+				continue;
+			}
 
-		// We call `fetch()` on the stub to send a request to the Durable Object instance
-		// The Durable Object instance will invoke its fetch handler to handle the request
-		let response = await stub.fetch(request);
+			if (message.body.type === 'page') {
+				const delay_amount = env.RANDOMIZE_TO_MAX ? Math.random() * env.DELAY_PER_QUEUE_EXECUTION : env.DELAY_PER_QUEUE_EXECUTION;
+				await new Promise((resolve) => setTimeout(resolve, delay_amount));
 
-		return response;
+				console.log(
+					'Execution:',
+					execution_random_id,
+					'Document:',
+					message.body.document_id,
+					'Message:',
+					message.body.page,
+					'/',
+					message.body.total_pages
+				);
+
+				if (message.body.page) {
+					const id = await env.MY_DURABLE_OBJECT.idFromName(message.body.document_id);
+					const stub = env.MY_DURABLE_OBJECT.get(id);
+					await stub.finished_page(message.body.page);
+
+					if (await stub.is_finished()) {
+						await env.MY_QUEUE.send({ type: 'end', document_id: message.body.document_id, start_time: message.body.start_time });
+					}
+				}
+			}
+		}
 	},
 };
